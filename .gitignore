@@ -1,0 +1,15 @@
+Dependencias
+
+pycache/
+*.pyc
+
+IDE
+
+.vscode/
+.idea/
+
+Variables de entorno y secrets
+
+.env
+telegram_token.txt
+*.log
