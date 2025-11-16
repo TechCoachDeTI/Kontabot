@@ -1,3 +1,5 @@
 python-telegram-bot
 Pillow
 pytesseract
+gspread
+oauth2client
