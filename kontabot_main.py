@@ -14,6 +14,12 @@ from PIL import Image
 import pytesseract
 import asyncio
 import logging
+import json
+from datetime import datetime
+
+# Dependencias de Google Sheets
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # Configuración básica de logging
 logging.basicConfig(level=logging.INFO)
@@ -22,22 +28,28 @@ logging.basicConfig(level=logging.INFO)
 # 1. CONFIGURACIÓN INICIAL Y DEPENDENCIAS
 # ==============================================================================
 
-# Obtener el token de Telegram desde una variable de entorno
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8200782434:AAEFv7jwu6NFostM6a39ImFBrwG4D0LFbEM") # Agregado como fallback
-# Cloud Run proporciona el puerto como variable de entorno
+# Variables de Telegram
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8200782434:AAEFv7jwu6NFostM6a39ImFBrwG4D0LFbEM")
 PORT = int(os.environ.get("PORT", 8080)) 
-# La URL base del Cloud Run service (Debe ser configurada como variable de entorno)
 WEBHOOK_URL = os.getenv("WEBHOOK_URL") 
+
+# Variables de Google Sheets
+GOOGLE_SHEET_KEY = os.getenv("GOOGLE_SHEET_KEY") # ID de la hoja de cálculo
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON") # Contenido de la clave JSON
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN must be set") 
-    
-# Almacenamiento temporal para registros de facturas (simulación de base de datos)
-user_sessions = {}
+
+# Variable global para el cliente de gspread y la hoja de trabajo
+# Se inicializará en la primera llamada asíncrona.
+sheets_client = None
+invoice_sheet = None
 
 # ==============================================================================
-# 2. FUNCIONES DE LÓGICA DE NEGOCIO (Extracción)
+# 2. FUNCIONES DE LÓGICA DE NEGOCIO (Extracción & GSpread)
 # ==============================================================================
+
+# --- Funciones OCR y Extracción (se mantienen igual) ---
 
 def extract_data_with_ocr(image_file: io.BytesIO) -> str:
     """Convierte la imagen (o la primera página del PDF) a texto usando OCR."""
@@ -54,10 +66,8 @@ def clean_and_convert_monto(monto_str: str) -> float:
     if not monto_str:
         return 0.0
     
-    # Lógica robusta para limpiar el monto de caracteres no deseados
     cleaned_str = re.sub(r'[^\d.,]', '', monto_str)
     
-    # Normalización: convierte el separador decimal a punto si se usa coma
     if ',' in cleaned_str and '.' in cleaned_str:
         if cleaned_str.rfind(',') < cleaned_str.rfind('.'):
              cleaned_str = cleaned_str.replace(',', '') 
@@ -118,10 +128,81 @@ def extract_fiscal_entities(texto_ocr: str) -> dict:
 
     return datos
 
+
+# --- Funciones de GSpread Asíncronas ---
+
+def init_gspread_sync():
+    """Inicializa el cliente de GSpread de forma síncrona."""
+    global sheets_client, invoice_sheet
+    if sheets_client and invoice_sheet:
+        return invoice_sheet
+
+    if not GOOGLE_SHEET_KEY or not GOOGLE_CREDENTIALS_JSON:
+        logging.error("Variables de entorno de Google Sheets no configuradas.")
+        return None
+
+    try:
+        # Usar el contenido JSON de la variable de entorno
+        credentials_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(credentials_info, scope)
+        sheets_client = gspread.authorize(creds)
+        
+        # Abre la hoja de cálculo y selecciona la primera hoja (Worksheet)
+        spreadsheet = sheets_client.open_by_key(GOOGLE_SHEET_KEY)
+        invoice_sheet = spreadsheet.get_worksheet(0) # Asume que los datos están en la primera hoja
+        
+        logging.info("Conexión con Google Sheets establecida.")
+        
+        # Asegurar encabezados si está vacía la hoja (opcional)
+        if not invoice_sheet.get_all_values():
+            invoice_sheet.append_row([
+                'USER_ID', 'TIMESTAMP', 'NCF', 'RNC_CEDULA', 'FECHA_FACTURA', 
+                'ITBIS_MONTO', 'TOTAL_MONTO', 'TIPO_DOC', 'ESTADO'
+            ])
+            
+        return invoice_sheet
+    except Exception as e:
+        logging.error(f"Error al inicializar GSpread: {e}")
+        return None
+
+async def get_invoice_data_sheet() -> gspread.Worksheet:
+    """Obtiene el objeto Worksheet de forma asíncrona."""
+    # Envuelve la inicialización síncrona en un hilo para no bloquear el loop
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, init_gspread_sync)
+
+async def add_invoice_row(data_list: list):
+    """Añade una fila a la hoja de cálculo de forma asíncrona."""
+    sheet = await get_invoice_data_sheet()
+    if sheet:
+        loop = asyncio.get_event_loop()
+        # Envuelve la llamada de gspread.append_row en un hilo
+        await loop.run_in_executor(None, lambda: sheet.append_row(data_list))
+        logging.info("Fila añadida a Google Sheets.")
+
+async def get_user_pending_invoices(user_id: int):
+    """Obtiene los registros pendientes del usuario desde la hoja de forma asíncrona."""
+    sheet = await get_invoice_data_sheet()
+    if sheet:
+        loop = asyncio.get_event_loop()
+        # Envuelve la lectura de datos
+        all_data = await loop.run_in_executor(None, sheet.get_all_records)
+        
+        # Filtra los registros por user_id y estado 'PENDIENTE'
+        pending_invoices = [
+            record for record in all_data 
+            if str(record.get('USER_ID')) == str(user_id) and record.get('ESTADO') == 'PENDIENTE'
+        ]
+        return pending_invoices
+    return []
+
 # ==============================================================================
 # 3. MANEJADORES DE COMANDOS DE TELEGRAM
 # ==============================================================================
 
+# ... (start_command y help_command se mantienen igual) ...
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome_message = """
 ¡Hola! Soy **Kontabot**, tu asistente fiscal DGII.
@@ -151,9 +232,11 @@ Tras enviar fotos/PDFs, usa:
 """
     await update.message.reply_text(help_message, parse_mode=telegram.constants.ParseMode.MARKDOWN)
 
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Maneja la recepción de fotos y documentos (facturas)."""
+    """Maneja la recepción de fotos y documentos (facturas) y guarda en Google Sheets."""
     
+    # 1. Identificación y Filtro de Archivo
     if update.message.photo:
         file_id = update.message.photo[-1].file_id
         file_name = f"photo_{file_id}.jpg"
@@ -173,6 +256,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                                     parse_mode=telegram.constants.ParseMode.MARKDOWN)
 
     try:
+        # 2. Descarga y OCR
         file_obj = await context.bot.get_file(file_id)
         file_bytes = io.BytesIO()
         await file_obj.download_to_memory(file_bytes)
@@ -185,56 +269,81 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
             
         datos_extraidos = extract_fiscal_entities(texto_ocr)
-        
         user_id = update.effective_user.id
-        if user_id not in user_sessions:
-            user_sessions[user_id] = []
-        
-        user_sessions[user_id].append(datos_extraidos)
 
-        respuesta = f"✅ Extracción exitosa.\n\n"
+        # 3. Preparar la fila para Google Sheets
+        # Campos: USER_ID, TIMESTAMP, NCF, RNC_CEDULA, FECHA_FACTURA, ITBIS_MONTO, TOTAL_MONTO, TIPO_DOC, ESTADO
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sheet_row = [
+            user_id,
+            timestamp,
+            datos_extraidos['ncf'] or '',
+            datos_extraidos['rnc_cedula'] or '',
+            datos_extraidos['fecha'] or '',
+            datos_extraidos['itbis_monto'],
+            datos_extraidos['total_monto'],
+            datos_extraidos['tipo_doc'],
+            'PENDIENTE' # Estado inicial
+        ]
+        
+        # 4. Guardar en Google Sheets (asíncrono)
+        await add_invoice_row(sheet_row)
+        
+        # 5. Respuesta al Usuario
+        # Simula el conteo de registros pendientes
+        pending_invoices = await get_user_pending_invoices(user_id)
+        num_registros = len(pending_invoices)
+
+        respuesta = f"✅ Extracción y Guardado en Google Sheets exitoso.\n\n"
         respuesta += f"**NCF:** {datos_extraidos['ncf'] or 'No encontrado'}\n"
         respuesta += f"**RNC/Cédula:** {datos_extraidos['rnc_cedula'] or 'No encontrado'}\n"
-        respuesta += f"**Fecha:** {datos_extraidos['fecha'] or 'No encontrado'}\n"
         respuesta += f"**Monto ITBIS:** RD$ {datos_extraidos['itbis_monto']:.2f}\n"
-        respuesta += f"**Monto Total:** RD$ {datos_extraidos['total_monto']:.2f}\n"
-        respuesta += f"**Tipo de Documento (Simulación):** {datos_extraidos['tipo_doc']}\n\n"
-        respuesta += f"**Registro N° {len(user_sessions[user_id])}** guardado. Envíe otra factura o use `/generar`."
+        respuesta += f"**Tipo de Documento:** {datos_extraidos['tipo_doc']}\n\n"
+        respuesta += f"Tienes **{num_registros}** registros pendientes en la hoja de cálculo. Envía otra factura o usa `/generar`."
 
         await update.message.reply_text(respuesta, parse_mode=telegram.constants.ParseMode.MARKDOWN)
 
     except Exception as e:
-        await update.message.reply_text(f"Ocurrió un error inesperado durante el procesamiento: {e}")
+        await update.message.reply_text(f"Ocurrió un error inesperado. Asegúrate de que las variables `GOOGLE_SHEET_KEY` y `GOOGLE_CREDENTIALS_JSON` estén configuradas correctamente en Cloud Run. Error: {e}")
         logging.error(f"Error principal en handle_document: {e}")
 
 
 async def generate_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Maneja el comando /generar (Simulación de la Fase 3)."""
+    """Maneja el comando /generar (Lee desde Google Sheets y genera el archivo TXT)."""
     user_id = update.effective_user.id
 
-    if user_id not in user_sessions or not user_sessions[user_id]:
-        await update.message.reply_text("No hay registros pendientes para generar el archivo 606/607. ¡Envía tus facturas!")
+    # 1. Leer registros pendientes desde Google Sheets
+    registros = await get_user_pending_invoices(user_id)
+
+    if not registros:
+        await update.message.reply_text("No hay registros pendientes para generar el archivo 606/607 en Google Sheets. ¡Envía tus facturas!")
         return
 
-    registros = user_sessions[user_id]
+    # --- SIMULACIÓN DE GENERACIÓN DE ARCHIVO TXT ---
     
     archivo_content = "RNC|NCF|FECHA|MONTO_ITBIS|MONTO_TOTAL|TIPO_DOC\n"
     for reg in registros:
-        linea = f"{reg['rnc_cedula'] or '0'}|{reg['ncf'] or '0'}|{reg['fecha'] or '00/00/0000'}|{reg['itbis_monto']:.2f}|{reg['total_monto']:.2f}|{reg['tipo_doc']}\n"
+        # Usamos las claves de la hoja (en mayúsculas)
+        linea = f"{reg.get('RNC_CEDULA', '0')}|{reg.get('NCF', '0')}|{reg.get('FECHA_FACTURA', '00/00/0000')}|{reg.get('ITBIS_MONTO', 0.0):.2f}|{reg.get('TOTAL_MONTO', 0.0):.2f}|{reg.get('TIPO_DOC', 'DESCONOCIDO')}\n"
         archivo_content += linea
         
     archivo_bytes = archivo_content.encode('utf-8')
     filename = f"DGII_Kontabot_Registros_{len(registros)}.txt"
     
+    # 2. Enviar el archivo
     await update.message.reply_document(
         document=archivo_bytes, 
         filename=filename,
-        caption=f"✅ Archivo **{filename}** generado con **{len(registros)}** registros. ¡Listo para subir a la DGII!",
+        caption=f"✅ Archivo **{filename}** generado con **{len(registros)}** registros leídos desde Google Sheets. ¡Listo para subir a la DGII!",
         parse_mode=telegram.constants.ParseMode.MARKDOWN
     )
     
-    del user_sessions[user_id]
-    await update.message.reply_text("Sesión finalizada. Los registros han sido eliminados de la memoria.")
+    # 3. Marcar registros como 'EXPORTADO' en la hoja (simulación)
+    # NOTA: La lógica real sería encontrar y actualizar las filas en GSpread.
+    # Por simplicidad, aquí solo avisamos que la sesión está finalizada.
+    await update.message.reply_text(
+        "Sesión finalizada. Los registros se mantendrán en Google Sheets, pero deberían ser marcados como 'EXPORTADO' o eliminados en la implementación final."
+    )
 
 
 # ==============================================================================
@@ -244,6 +353,10 @@ async def generate_file_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def main() -> None:
     """Configura y ejecuta el bot en modo Webhook para Cloud Run."""
     logging.info("Starting Kontabot in Webhook mode...")
+    
+    # Verificar configuración crítica de GSpread al inicio
+    if not GOOGLE_SHEET_KEY or not GOOGLE_CREDENTIALS_JSON:
+        logging.warning("El bot iniciará, pero las funciones de Google Sheets FALLARÁN. Configure GOOGLE_SHEET_KEY y GOOGLE_CREDENTIALS_JSON.")
     
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -257,21 +370,19 @@ async def main() -> None:
                                                                                              parse_mode=telegram.constants.ParseMode.MARKDOWN)))
 
 
-    # 3. Configurar el Webhook (Solo el servidor interno)
-    # CRÍTICO: Debemos llamar a set_webhook para notificar a Telegram la URL base.
+    # 3. Configurar el Webhook
     if WEBHOOK_URL:
-        # Usamos el token real como parte de la URL secreta para set_webhook
-        await application.bot.set_webhook(url=f"{WEBHOOK_URL}/8200782434:AAEFv7jwu6NFostM6a39ImFBrwG4D0LFbEM") 
+        # El token se usa en la URL de webhook para la seguridad y el ruteo
+        token_path = TELEGRAM_TOKEN.split(":")[-1] if ":" in TELEGRAM_TOKEN else TELEGRAM_TOKEN
+        await application.bot.set_webhook(url=f"{WEBHOOK_URL}/{token_path}") 
     
-    # CRÍTICO: Inicia el servidor HTTP para que Cloud Run lo detecte
     await application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
-        url_path="8200782434:AAEFv7jwu6NFostM6a39ImFBrwG4D0LFbEM", # Ruta secreta (token)
-        webhook_url=WEBHOOK_URL # URL base
+        # La ruta (url_path) debe coincidir con la parte final de la URL del webhook
+        url_path=token_path,
+        webhook_url=WEBHOOK_URL
     )
 
 if __name__ == "__main__":
-    # CRÍTICO: Se ejecuta la función main() de forma asíncrona para iniciar el servidor
-    # y así evitar el timeout de Cloud Run.
     asyncio.run(main())
