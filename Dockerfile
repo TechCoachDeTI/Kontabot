@@ -1,41 +1,43 @@
-Usa una imagen base de Python que incluya los paquetes de desarrollo necesarios
-
+# Usa una imagen base de Python optimizada para ser pequeña y eficiente
 FROM python:3.11-slim
 
-1. Instalar Tesseract OCR y sus dependencias de sistema
+# ==============================================================================
+# 1. INSTALACIÓN DE DEPENDENCIAS DE SISTEMA (TESSERACT OCR)
+# ==============================================================================
 
-Tesseract es necesario para que pytesseract pueda funcionar.
+# Actualiza la lista de paquetes e instala Tesseract OCR, la librería de desarrollo,
+# y el paquete de idioma español (tesseract-ocr-spa) para la DGII.
+RUN apt-get update --fix-missing && \
+    apt-get install -y \
+        tesseract-ocr \
+        tesseract-ocr-spa \
+        libtesseract-dev \
+        && \
+    # Limpia los cachés para reducir el tamaño final de la imagen del contenedor
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update && 
+# ==============================================================================
+# 2. CONFIGURACIÓN DEL ENTORNO DE PYTHON
+# ==============================================================================
 
-apt-get install -y tesseract-ocr libtesseract-dev && 
-
-apt-get clean && 
-
-rm -rf /var/lib/apt/lists/*
-
-2. Establecer el directorio de trabajo
-
+# Establece /app como el directorio de trabajo donde residirá el código del bot
 WORKDIR /app
 
-3. Copiar las dependencias de Python
-
+# Copia el archivo de requisitos de Python
 COPY requirements.txt .
 
-4. Instalar las dependencias de Python
-
+# Instala las librerías de Python listadas en requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-5. Copiar el código de la aplicación
-
+# Copia el código principal de la aplicación
 COPY kontabot_main.py .
 
-6. Comando de ejecución
+# ==============================================================================
+# 3. COMANDO DE EJECUCIÓN
+# ==============================================================================
 
-Este comando se ejecuta cuando se inicia el contenedor.
-
-En Cloud Run, este contenedor debe estar expuesto a la web si usas Webhooks.
-
-Para el Polling simple, este comando inicia el script Python.
-
+# Define el comando que se ejecuta cuando se inicia el contenedor
+# Esto inicia el bot en modo Polling (para desarrollo)
+# NOTA: Para producción con Webhooks, la configuración en Cloud Run podría variar.
 CMD ["python", "kontabot_main.py"]
