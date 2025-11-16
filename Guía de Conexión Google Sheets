@@ -1,0 +1,95 @@
+🔗 Conexión de Kontabot a Google Sheets
+
+Para que Kontabot, alojado en Google Cloud Run, pueda acceder y escribir datos en tu hoja de cálculo, debes configurar una Cuenta de Servicio y proporcionarle las credenciales necesarias.
+
+Este proceso garantiza que el bot se autentique de forma segura sin usar tu contraseña personal.
+
+Paso 1: Habilitar APIs en Google Cloud
+
+Asegúrate de que tu proyecto de Google Cloud tenga habilitadas las APIs necesarias:
+
+Ve a la consola de Google Cloud (GCP).
+
+En el menú de navegación, busca "API y Servicios" -> "Panel".
+
+Haz clic en "Habilitar APIs y Servicios" y busca y habilita:
+
+Google Sheets API
+
+Google Drive API (Necesaria para que la Cuenta de Servicio pueda encontrar la hoja).
+
+Paso 2: Crear la Cuenta de Servicio (Service Account)
+
+Necesitas generar la clave secreta que el bot usará para identificarse.
+
+En la consola de GCP, ve a "IAM y Administración" -> "Cuentas de Servicio".
+
+Haz clic en "Crear cuenta de servicio".
+
+Dale un nombre, como kontabot-sheets-writer.
+
+En la sección "Otorgar a esta cuenta de servicio acceso al proyecto", selecciona el rol de "Editor" o, como mínimo, "Visualizador de Cloud Run" y luego haz clic en "Continuar" y "Listo".
+
+Paso 3: Descargar la Clave JSON
+
+Ahora debes obtener el archivo de credenciales que contiene la clave privada:
+
+Vuelve a la lista de "Cuentas de Servicio".
+
+Haz clic en el nombre de la cuenta que acabas de crear (kontabot-sheets-writer).
+
+Ve a la pestaña "Claves".
+
+Haz clic en "Añadir clave" -> "Crear clave nueva".
+
+Selecciona el formato JSON y haz clic en "Crear".
+
+Guarda este archivo JSON en un lugar seguro. Contiene las credenciales privadas.
+
+IMPORTANTE: El archivo JSON descargado contiene la clave que necesitarás para el siguiente paso. Ábrelo con un editor de texto y copia todo su contenido.
+
+Paso 4: Configurar Variables de Entorno en Cloud Run
+
+El código de Kontabot está diseñado para leer la clave JSON y el ID de la hoja desde variables de entorno.
+
+Abre el archivo JSON que descargaste. Copia todo el texto JSON completo (incluyendo llaves {} y comillas).
+
+Ve a tu servicio de Cloud Run (donde está alojado Kontabot).
+
+Edita el servicio y navega a la sección "Variables de entorno".
+
+Crea o actualiza las siguientes variables:
+
+Variable
+
+Valor
+
+Uso
+
+GOOGLE_SHEET_KEY
+
+El ID de tu Google Sheet (ej: 1jK...).
+
+El ID está en la URL de tu hoja.
+
+GOOGLE_CREDENTIALS_JSON
+
+PEGA TODO EL TEXTO JSON COMPLETO AQUÍ.
+
+La clave de autenticación.
+
+Paso 5: Compartir la Hoja de Cálculo
+
+El paso final es darle acceso a la hoja de cálculo a la Cuenta de Servicio.
+
+Abre la Google Sheet donde Kontabot debe escribir los datos.
+
+Haz clic en el botón "Compartir" en la esquina superior derecha.
+
+En el archivo JSON (o en la lista de Cuentas de Servicio en GCP) encontrarás un email que termina en @<tu_proyecto>.iam.gserviceaccount.com. Copia este email.
+
+Pega el email de la Cuenta de Servicio en el campo de compartir de la hoja.
+
+Asegúrate de darle permiso de "Editor" y haz clic en "Enviar".
+
+Una vez que guardes los cambios en Cloud Run, tu bot se reiniciará con las credenciales, y podrá conectarse a tu Google Sheet para guardar los registros de las facturas.
